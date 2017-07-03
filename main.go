@@ -4,12 +4,32 @@ import (
 	"github.com/go-telegram-bot-api/telegram-bot-api"
 	"log"
 	"fmt"
+
+	"github.com/boltdb/bolt"
+	"strconv"
+	"encoding/json"
 )
 
 const BOT_TOKEN string = "332823200:AAHEEUxiVc3EW4J1oIbPwgiPjzypp8HNZVs"
 const ANTHONY int64 = 319810559
 
 var tasks map[string]int
+
+type Task struct {
+	Name string
+}
+type TaskList struct {
+	ID             int
+	List           []Task
+	CreationIsDone bool
+}
+
+type TODO struct {
+	ID     int
+	UserID int
+	Tasks  map[string]int
+}
+
 
 
 func main() {
@@ -24,6 +44,12 @@ func main() {
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
+
+	db, err := bolt.Open("bolt.db", 0600, nil)
+	if err != nil {
+		log.Fatalf("Could not open bolt db: %v", err)
+	}
+	defer db.Close()
 
 	updates, err := bot.GetUpdatesChan(u)
 	if err != nil {
@@ -61,12 +87,126 @@ func main() {
 		}
 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 
-		if update.Message.Text == "/tasks" {
-			msg := newTasksMsg(int64(update.Message.From.ID))
+		userID := update.Message.From.ID
+		switch update.Message.Text {
+		case "/start":
+			db.Update(func (tx *bolt.Tx) error {
+				bkt, err := tx.CreateBucketIfNotExists([]byte("Users"))
+				if err != nil {
+					log.Printf("Could not create bucket: %v", err)
+					return err
+				}
+				err = bkt.Put([]byte(strconv.Itoa(userID)), []byte("true"))
+				if err != nil {
+					log.Printf("Could not PUT: %v", err)
+				}
+				return err
+			})
+
+			msg := tgbotapi.NewMessage(int64(userID), "Добавьте задачи")
 			bot.Send(msg)
-		} else {
-			msg := tgbotapi.NewMessage(int64(update.Message.From.ID), "Доступные команды:\n/tasks   - Список дел")
+		case "/create":
+			db.Update(func (tx *bolt.Tx) error {
+				bkt, err := tx.CreateBucketIfNotExists([]byte("UsersTaskLists"))
+				if err != nil {
+					log.Printf("Could not create bucket: %v", err)
+					return err
+				}
+				id, _ := bkt.NextSequence()
+				tlist := TaskList{
+					ID: int(id),
+				}
+				tlistB, err := json.Marshal(tlist)
+				if err != nil {
+					log.Printf("Could not marshal new tasklist: %v", err)
+					return err
+				}
+				err = bkt.Put([]byte(strconv.Itoa(userID)), tlistB)
+				if err != nil {
+					log.Printf("Could not PUT: %v", err)
+					return err
+				}
+				return err
+			})
+			msg := tgbotapi.NewMessage(int64(userID), "Введите задачу 1")
 			bot.Send(msg)
+		case "/done":
+			db.Update(func(tx *bolt.Tx) error {
+				bkt := tx.Bucket([]byte("UsersTaskLists"))
+				if bkt != nil {
+					tlistB := bkt.Get([]byte(strconv.Itoa(userID)))
+					if tlistB != nil {
+						tlist := TaskList{}
+						err := json.Unmarshal(tlistB, &tlist)
+						if err != nil {
+							log.Printf("Could not unmarhal tasklist: %v", err)
+							return err
+						}
+						tlist.CreationIsDone = true
+						tlistB, err = json.Marshal(tlist)
+						if err != nil {
+							log.Printf("Could not marshal: %v")
+							return err
+						}
+						bkt.Put([]byte(strconv.Itoa(userID)), tlistB)
+						msg := tgbotapi.NewMessage(int64(userID), "Ваш список задач сохранен. /tasklist")
+						bot.Send(msg)
+						return nil
+					}
+				}
+				return nil
+			})
+		case "/tasklist":
+			db.View(func(tx *bolt.Tx) error {
+				bkt := tx.Bucket([]byte("UsersTaskLists"))
+				if bkt != nil {
+					tlistB := bkt.Get([]byte(strconv.Itoa(userID)))
+					var count int
+					if tlistB != nil {
+						tlist := TaskList{}
+						json.Unmarshal(tlistB, tlist)
+						count = len(tlist.List)
+					}
+
+					msg := tgbotapi.NewMessage(int64(userID), "У вас всего " + strconv.Itoa(count) + " задач.")
+					bot.Send(msg)
+				}
+				return nil
+			})
+		default:
+			db.Update(func(tx *bolt.Tx) error {
+				bkt := tx.Bucket([]byte("UsersTaskLists"))
+				if bkt != nil {
+					tlistB := bkt.Get([]byte(strconv.Itoa(userID)))
+					// determine Task creation process
+					if tlistB != nil {
+						tlist := TaskList{}
+						err := json.Unmarshal(tlistB, &tlist)
+						if err != nil {
+							log.Printf("Could not unmarhal tasklist: %v", err)
+							return err
+						}
+						if !tlist.CreationIsDone {
+							task := Task{
+								Name: update.Message.Text,
+							}
+							tlist.List = append(tlist.List, task)
+							tlistB, err = json.Marshal(tlist)
+							if err != nil {
+								log.Printf("Could not marshal: %v")
+								return err
+							}
+							bkt.Put([]byte(strconv.Itoa(userID)), tlistB)
+							msg := tgbotapi.NewMessage(int64(userID), "Введите следующую задачу либо завершите /done")
+							bot.Send(msg)
+							return nil
+						}
+					}
+					msg := tgbotapi.NewMessage(int64(userID), "Доступные команды:\n/tasks   - Список дел")
+					bot.Send(msg)
+				}
+				return nil
+			})
 		}
 	}
 }
